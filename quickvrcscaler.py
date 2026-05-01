@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 import tkinter as tk
 from tkinter import ttk
+from types import SimpleNamespace
 
 from pythonosc import udp_client
 from pythonosc.dispatcher import Dispatcher
@@ -17,11 +19,13 @@ from pythonosc.osc_server import ThreadingOSCUDPServer
 
 try:
     from tinyoscquery.queryservice import OSCQueryService
-    from tinyoscquery.query import OSCQueryBrowser, OSCQueryClient
+    from tinyoscquery.query import OSCQueryBrowser
     from tinyoscquery.utility import get_open_tcp_port, get_open_udp_port
+    import requests  # used directly so we can pass an HTTP timeout
     _OSCQUERY_AVAILABLE = True
 except Exception:
     _OSCQUERY_AVAILABLE = False
+    requests = None  # type: ignore[assignment]
 
 VRCHAT_HOST = "127.0.0.1"
 SEND_PORT = 9000
@@ -36,6 +40,15 @@ SAFE_MIN = 0.1
 SAFE_MAX = 100.0
 SLIDER_MIN = 0.1
 SLIDER_MAX = 5.0
+
+# OSCQuery polling
+POLL_INTERVAL_MS = 10_000
+# tinyoscquery's built-in HTTP client doesn't pass a timeout, so a half-dead
+# OSCQuery peer can hang the worker thread forever. We do our own requests.get
+# calls with this timeout to bound that.
+OSCQUERY_HTTP_TIMEOUT = 2.0
+# Initial mDNS discovery needs a beat before any services show up.
+OSCQUERY_INITIAL_DISCOVERY_DELAY = 0.8
 
 
 class App:
@@ -57,9 +70,18 @@ class App:
         # Suppress send when slider is updated programmatically from incoming OSC
         self._suppress_send = False
 
+        # OSCQuery polling state. The browser is long-lived because mDNS
+        # discovery is meant to be continuous — recreating it per poll leaks
+        # zeroconf threads and sockets, which after a couple of hours starves
+        # the GIL enough to freeze the UI. The in-flight flag keeps a stalled
+        # worker from causing follow-up workers to pile up behind it.
+        self._browser: "OSCQueryBrowser | None" = None
+        self._poll_in_flight = False
+
         self._build_ui()
         self._start_server()
         self._start_oscquery()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(50, self._drain_events)
         # Try to actively pull values shortly after startup, then keep polling.
         self.root.after(1500, self._poll_oscquery)
@@ -238,56 +260,127 @@ class App:
             print(f"[QuickVRCScaler] OSCQuery unavailable: {exc}")
 
     def _poll_oscquery(self) -> None:
-        """Discover VRChat's OSCQuery service and pull current values."""
-        if _OSCQUERY_AVAILABLE:
+        """Kick off (at most one) OSCQuery poll worker, then reschedule.
+
+        The in-flight guard matters: without it a stalled HTTP request would
+        let workers accumulate every 10 s, and each one keeps zeroconf and
+        the GIL busy enough to eventually freeze the UI.
+        """
+        if _OSCQUERY_AVAILABLE and not self._poll_in_flight:
+            self._poll_in_flight = True
             threading.Thread(target=self._poll_oscquery_worker, daemon=True).start()
-        # Schedule next poll regardless (cheap if no service found).
-        self.root.after(10_000, self._poll_oscquery)
+        self.root.after(POLL_INTERVAL_MS, self._poll_oscquery)
 
     def _poll_oscquery_worker(self) -> None:
         try:
-            browser = OSCQueryBrowser()
-            # Give zeroconf a moment to discover services.
-            import time as _t
-            _t.sleep(0.8)
-            # Restrict to services that expose VRChat's eye-height endpoint.
-            # This avoids latching onto unrelated OSCQuery apps on the same
-            # machine (e.g. VRCFT, which exposes its own /avatar/parameters).
-            candidates = browser.find_nodes_by_endpoint_address(ADDR_HEIGHT)
-        except Exception as exc:
-            print(f"[QuickVRCScaler] OSCQuery browse failed: {exc}")
-            return
+            self._poll_oscquery_once()
+        finally:
+            # Always clear the flag, even on unexpected exceptions, so we
+            # don't permanently stop polling because of a single bad cycle.
+            self._poll_in_flight = False
 
-        svc = self._pick_vrchat_service(candidates)
-        if svc is None:
-            return
+    def _poll_oscquery_once(self) -> None:
+        """Run one poll cycle: enumerate discovered services, pull values."""
+        # Reuse a single OSCQueryBrowser for the lifetime of the app. The
+        # underlying zeroconf instance keeps discovering services in the
+        # background — we just read what it has each tick.
+        if self._browser is None:
+            try:
+                self._browser = OSCQueryBrowser()
+            except Exception as exc:
+                print(f"[QuickVRCScaler] OSCQuery browse failed: {exc}")
+                return
+            # Give the very first browse a moment to populate. Subsequent
+            # polls hit a warm browser and skip this delay entirely.
+            time.sleep(OSCQUERY_INITIAL_DISCOVERY_DELAY)
 
         try:
-            client = OSCQueryClient(svc)
-            for addr, key in (
-                (ADDR_HEIGHT, "height"),
-                (ADDR_MIN, "min"),
-                (ADDR_MAX, "max"),
-                (ADDR_ALLOWED, "allowed"),
-            ):
-                try:
-                    node = client.query_node(addr)
-                except Exception:
-                    node = None
-                if node is None:
-                    continue
-                value = getattr(node, "value", None)
-                if isinstance(value, (list, tuple)) and value:
-                    value = value[0]
-                if value is None:
-                    continue
-                self.events.put((key, value))
-        except Exception:
+            services = list(self._browser.get_discovered_oscquery())
+        except Exception as exc:
+            print(f"[QuickVRCScaler] OSCQuery enumerate failed: {exc}")
             return
+
+        # Build (svc, host_info, _) triples so _pick_vrchat_service can
+        # do name-based preference (and skip e.g. VRCFT on the same host).
+        candidates = []
+        for svc in services:
+            host_info = self._fetch_host_info(svc)
+            if host_info is None:
+                continue
+            candidates.append((svc, host_info, None))
+
+        chosen = self._pick_vrchat_service(candidates)
+        if chosen is None:
+            return
+
+        for addr, key in (
+            (ADDR_HEIGHT, "height"),
+            (ADDR_MIN, "min"),
+            (ADDR_MAX, "max"),
+            (ADDR_ALLOWED, "allowed"),
+        ):
+            value = self._fetch_node_value(chosen, addr)
+            if value is None:
+                continue
+            self.events.put((key, value))
+
+    @staticmethod
+    def _http_get_json(url: str):
+        """GET `url` and return parsed JSON, or None on any failure.
+
+        The whole point of this helper is to enforce a timeout on every
+        OSCQuery HTTP call — tinyoscquery's own client does not, so a
+        half-dead peer would otherwise hang the worker thread forever.
+        """
+        if requests is None:
+            return None
+        try:
+            r = requests.get(url, timeout=OSCQUERY_HTTP_TIMEOUT)
+        except requests.RequestException:
+            return None
+        if r.status_code != 200:
+            return None
+        try:
+            return r.json()
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _service_url(service_info, path: str):
+        """Build the OSCQuery HTTP URL for a zeroconf ServiceInfo, or None."""
+        try:
+            ip = ".".join(str(int(b)) for b in service_info.addresses[0])
+            port = service_info.port
+        except Exception:
+            return None
+        return f"http://{ip}:{port}{path}"
+
+    @classmethod
+    def _fetch_host_info(cls, service_info):
+        url = cls._service_url(service_info, "/HOST_INFO")
+        if url is None:
+            return None
+        data = cls._http_get_json(url)
+        if not isinstance(data, dict):
+            return None
+        return SimpleNamespace(name=data.get("NAME") or "")
+
+    @classmethod
+    def _fetch_node_value(cls, service_info, address: str):
+        url = cls._service_url(service_info, address)
+        if url is None:
+            return None
+        data = cls._http_get_json(url)
+        if not isinstance(data, dict):
+            return None
+        value = data.get("VALUE")
+        if isinstance(value, list) and value:
+            return value[0]
+        return None
 
     @staticmethod
     def _pick_vrchat_service(candidates):
-        """Choose the best OSCQuery service from `find_nodes_by_endpoint_address`.
+        """Choose the best OSCQuery service from a list of (svc, host_info, _) triples.
 
         When multiple OSCQuery apps are running (e.g. VRCFT alongside VRChat),
         prefer the one whose advertised host name identifies it as VRChat.
@@ -302,6 +395,26 @@ class App:
             return 0 if "vrchat" in name else 1
 
         return sorted(candidates, key=vrchat_priority)[0][0]
+
+    def _on_close(self) -> None:
+        """Best-effort cleanup of background discovery before the window dies.
+
+        Closes the long-lived zeroconf instance so its threads and multicast
+        socket are released promptly. Wrapped in try/except because shutdown
+        races with mainloop teardown and we'd rather log nothing than crash
+        on the way out.
+        """
+        browser = self._browser
+        self._browser = None
+        if browser is not None:
+            try:
+                browser.zc.close()
+            except Exception:
+                pass
+        try:
+            self.root.destroy()
+        except tk.TclError:
+            pass
 
     def _handle_osc(self, _addr: str, key: str, *args) -> None:
         if not args:
