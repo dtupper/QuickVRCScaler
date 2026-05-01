@@ -1,0 +1,2 @@
+python-osc>=1.8.3
+tinyoscquery @ git+https://github.com/cyberkitsune/tinyoscquery
