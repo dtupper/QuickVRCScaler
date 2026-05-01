@@ -42,8 +42,8 @@ class App:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         root.title("QuickVRCScaler")
-        root.geometry("440x340")
-        root.minsize(440, 340)
+        root.geometry("540x640")
+        root.minsize(540, 640)
 
         self.client = udp_client.SimpleUDPClient(VRCHAT_HOST, SEND_PORT)
         self.events: queue.Queue[tuple[str, object]] = queue.Queue()
@@ -147,7 +147,45 @@ class App:
             text=f"Send → {VRCHAT_HOST}:{SEND_PORT}    Listen ← :{LISTEN_PORT}",
             foreground="#666",
         )
-        status.pack(anchor="w", padx=12, pady=(0, 8))
+        status.pack(anchor="w", padx=12, pady=(0, 4))
+
+        # --- Quick set (VR-overlay friendly chunky buttons) ----------------
+        try:
+            ttk.Style().configure(
+                "Quick.TButton", font=("Segoe UI", 13, "bold"), padding=(8, 14)
+            )
+        except tk.TclError:
+            pass
+
+        quick = ttk.LabelFrame(self.root, text="Quick set")
+        quick.pack(fill="x", padx=12, pady=(0, 10))
+
+        # 4 columns × 4 rows, each cell stretches via column/rowconfigure.
+        presets = [
+            ("0.1 m", 0.1), ("1 m", 1.0), ("2 m", 2.0), ("3 m", 3.0),
+            ("5 m", 5.0), ("10 m", 10.0), ("25 m", 25.0), ("Reset 1.6 m", 1.6),
+        ]
+        adjust = [
+            ("-50%", 0.5), ("-25%", 0.75), ("-10%", 0.9), ("÷2", 0.5),
+            ("×2", 2.0), ("+10%", 1.1), ("+25%", 1.25), ("+50%", 1.5),
+        ]
+
+        grid_frame = ttk.Frame(quick)
+        grid_frame.pack(fill="both", expand=True, padx=6, pady=8)
+        for c in range(4):
+            grid_frame.columnconfigure(c, weight=1, uniform="quick")
+
+        for i, (label, h) in enumerate(presets):
+            ttk.Button(
+                grid_frame, text=label, style="Quick.TButton",
+                command=lambda v=h: self._apply_preset(v),
+            ).grid(row=i // 4, column=i % 4, sticky="nsew", padx=3, pady=3)
+
+        for i, (label, factor) in enumerate(adjust):
+            ttk.Button(
+                grid_frame, text=label, style="Quick.TButton",
+                command=lambda f=factor: self._apply_scale(f),
+            ).grid(row=2 + i // 4, column=i % 4, sticky="nsew", padx=3, pady=3)
 
     # --- OSC server -------------------------------------------------------
 
@@ -212,40 +250,58 @@ class App:
             # Give zeroconf a moment to discover services.
             import time as _t
             _t.sleep(0.8)
-            services = browser.get_discovered_oscquery()
+            # Restrict to services that expose VRChat's eye-height endpoint.
+            # This avoids latching onto unrelated OSCQuery apps on the same
+            # machine (e.g. VRCFT, which exposes its own /avatar/parameters).
+            candidates = browser.find_nodes_by_endpoint_address(ADDR_HEIGHT)
         except Exception as exc:
             print(f"[QuickVRCScaler] OSCQuery browse failed: {exc}")
             return
 
-        for svc in services:
-            try:
-                client = OSCQueryClient(svc)
-                root_node = client.query_node("/avatar")
-                if root_node is None:
+        svc = self._pick_vrchat_service(candidates)
+        if svc is None:
+            return
+
+        try:
+            client = OSCQueryClient(svc)
+            for addr, key in (
+                (ADDR_HEIGHT, "height"),
+                (ADDR_MIN, "min"),
+                (ADDR_MAX, "max"),
+                (ADDR_ALLOWED, "allowed"),
+            ):
+                try:
+                    node = client.query_node(addr)
+                except Exception:
+                    node = None
+                if node is None:
                     continue
-                # Probe each address; if VRChat exposes it, push to UI queue.
-                for addr, key in (
-                    (ADDR_HEIGHT, "height"),
-                    (ADDR_MIN, "min"),
-                    (ADDR_MAX, "max"),
-                    (ADDR_ALLOWED, "allowed"),
-                ):
-                    try:
-                        node = client.query_node(addr)
-                    except Exception:
-                        node = None
-                    if node is None:
-                        continue
-                    value = getattr(node, "value", None)
-                    if isinstance(value, (list, tuple)) and value:
-                        value = value[0]
-                    if value is None:
-                        continue
-                    self.events.put((key, value))
-                # First service that exposes /avatar wins.
-                return
-            except Exception:
-                continue
+                value = getattr(node, "value", None)
+                if isinstance(value, (list, tuple)) and value:
+                    value = value[0]
+                if value is None:
+                    continue
+                self.events.put((key, value))
+        except Exception:
+            return
+
+    @staticmethod
+    def _pick_vrchat_service(candidates):
+        """Choose the best OSCQuery service from `find_nodes_by_endpoint_address`.
+
+        When multiple OSCQuery apps are running (e.g. VRCFT alongside VRChat),
+        prefer the one whose advertised host name identifies it as VRChat.
+        Falls back to the first candidate if no name matches.
+        """
+        if not candidates:
+            return None
+
+        def vrchat_priority(triple) -> int:
+            host_info = triple[1] if len(triple) > 1 else None
+            name = (getattr(host_info, "name", "") or "").lower()
+            return 0 if "vrchat" in name else 1
+
+        return sorted(candidates, key=vrchat_priority)[0][0]
 
     def _handle_osc(self, _addr: str, key: str, *args) -> None:
         if not args:
@@ -327,13 +383,25 @@ class App:
         self._send_height(h)
 
     def _reset(self) -> None:
+        self._apply_preset(1.6)
+
+    def _current_height(self) -> float:
+        if self.cur_height is not None:
+            return self.cur_height
+        return float(self.slider_var.get())
+
+    def _apply_preset(self, h: float) -> None:
+        h = max(0.01, min(10000.0, h))
         self._suppress_send = True
         try:
-            self.slider_var.set(1.6)
-            self.height_label.configure(text="1.60 m")
+            self.slider_var.set(max(SLIDER_MIN, min(SLIDER_MAX, h)))
+            self.height_label.configure(text=f"{h:.2f} m")
         finally:
             self._suppress_send = False
-        self._send_height(1.6)
+        self._send_height(h)
+
+    def _apply_scale(self, factor: float) -> None:
+        self._apply_preset(self._current_height() * factor)
 
     def _send_height(self, h: float) -> None:
         try:
