@@ -4,7 +4,8 @@ A small desktop GUI for VRChat's [avatar scaling OSC endpoints](https://docs.vrc
 
 ## Features
 
-- **Slider** for eye height (0.1 m – 5.0 m) plus an exact-value entry that accepts VRChat's full 0.01 m – 10 000 m range.
+- **Weighted logarithmic slider** for VRChat's full 0.01 m – 10 000 m range, tuned for finer control in the supported 0.1 m – 100 m range.
+- **Custom reset default** saved locally, because VRChat OSC does not expose an avatar's original eye height.
 - **Live readouts** of every scaling endpoint VRChat exposes:
   - `/avatar/eyeheight`
   - `/avatar/eyeheightmin`
@@ -13,7 +14,7 @@ A small desktop GUI for VRChat's [avatar scaling OSC endpoints](https://docs.vrc
 - **Warnings** when:
   - the world or Udon has disabled scaling (writes will be ignored),
   - the requested height is outside VRChat's officially supported 0.1 m – 100 m range,
-  - the requested height is outside the avatar's Udon-configured min/max.
+  - the requested height is outside custom world/Udon-configured min/max.
 - **OSCQuery integration** so VRChat actively pushes current values on connect — readouts populate without waiting for an avatar change.
 
 ## Requirements
@@ -43,8 +44,10 @@ python quickvrcscaler.py
 
 1. Launch VRChat with OSC enabled.
 2. Launch QuickVRCScaler.
-3. Drag the slider, type a value, or hit **Reset 1.6 m**. The avatar's eye height updates live.
+3. Drag the slider, type a value, or use **Reset**. The avatar's eye height updates live.
 4. **Refresh** forces a re-poll of the read-only endpoints (min/max/allowed) via OSCQuery.
+
+Use the reset button's menu to save the current height as your local default.
 
 The app sends to `127.0.0.1:9000` and listens on `127.0.0.1:9001` — VRChat's standard OSC ports.
 
